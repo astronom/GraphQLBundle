@@ -6,6 +6,7 @@ namespace Overblog\GraphQLBundle\DependencyInjection\Compiler;
 
 use InvalidArgumentException;
 use Overblog\GraphQLBundle\Config\Parser\AnnotationParser;
+use Overblog\GraphQLBundle\Config\Parser\AttributeParser;
 use Overblog\GraphQLBundle\Config\Parser\GraphQLParser;
 use Overblog\GraphQLBundle\Config\Parser\PreParserInterface;
 use Overblog\GraphQLBundle\Config\Parser\XmlParser;
@@ -41,6 +42,7 @@ class ConfigParserPass implements CompilerPassInterface
         'xml' => 'xml',
         'graphql' => '{graphql,graphqls}',
         'annotation' => 'php',
+        'attribute' => 'php',
     ];
 
     public const PARSERS = [
@@ -48,6 +50,7 @@ class ConfigParserPass implements CompilerPassInterface
         'xml' => XmlParser::class,
         'graphql' => GraphQLParser::class,
         'annotation' => AnnotationParser::class,
+        'attribute' => AttributeParser::class,
     ];
 
     private static array $defaultDefaultConfig = [
@@ -56,6 +59,7 @@ class ConfigParserPass implements CompilerPassInterface
                 'auto_discover' => [
                     'root_dir' => true,
                     'bundles' => true,
+                    'built_in' => true,
                 ],
                 'types' => [],
             ],
@@ -91,7 +95,8 @@ class ConfigParserPass implements CompilerPassInterface
 
         // treats mappings
         // Pre-parse all files
-        AnnotationParser::reset();
+        AnnotationParser::reset($config);
+        AttributeParser::reset($config);
         $typesNeedPreParsing = $this->typesNeedPreParsing();
         foreach ($typesMappings as $params) {
             if ($typesNeedPreParsing[$params['type']]) {
@@ -177,8 +182,8 @@ class ConfigParserPass implements CompilerPassInterface
         if ($mappingConfig['auto_discover']['bundles']) {
             $mappingFromBundles = $this->mappingFromBundles($container);
             $typesMappings = array_merge($typesMappings, $mappingFromBundles);
-        } else {
-            // enabled only for this bundle
+        }
+        if ($mappingConfig['auto_discover']['built_in']) {
             $typesMappings[] = [
                 'dir' => $this->bundleDir(OverblogGraphQLBundle::class).'/Resources/config/graphql',
                 'types' => ['yaml'],
@@ -211,6 +216,11 @@ class ConfigParserPass implements CompilerPassInterface
 
         // auto detect from bundle
         foreach ($bundles as $name => $class) {
+            // skip this bundle
+            if (OverblogGraphQLBundle::class === $class) {
+                continue;
+            }
+
             $bundleDir = $this->bundleDir($class);
 
             // only config files (yml or xml)

@@ -12,7 +12,7 @@ use Overblog\GraphQLBundle\CacheWarmer\CompileCacheWarmer;
 use Overblog\GraphQLBundle\Config\Processor\BuilderProcessor;
 use Overblog\GraphQLBundle\Definition\Builder\SchemaBuilder;
 use Overblog\GraphQLBundle\Definition\Resolver\MutationInterface;
-use Overblog\GraphQLBundle\Definition\Resolver\ResolverInterface;
+use Overblog\GraphQLBundle\Definition\Resolver\QueryInterface;
 use Overblog\GraphQLBundle\Error\ErrorHandler;
 use Overblog\GraphQLBundle\Error\ExceptionConverter;
 use Overblog\GraphQLBundle\Error\ExceptionConverterInterface;
@@ -97,8 +97,8 @@ class OverblogGraphQLExtension extends Extension
         $container->registerForAutoconfiguration(MutationInterface::class)
             ->addTag('overblog_graphql.mutation');
 
-        $container->registerForAutoconfiguration(ResolverInterface::class)
-            ->addTag('overblog_graphql.resolver');
+        $container->registerForAutoconfiguration(QueryInterface::class)
+            ->addTag('overblog_graphql.query');
 
         $container->registerForAutoconfiguration(Type::class)
             ->addTag('overblog_graphql.type');
@@ -113,7 +113,7 @@ class OverblogGraphQLExtension extends Extension
                     new Reference('translator.default', $container::NULL_ON_INVALID_REFERENCE),
                 ])
                 ->addTag(
-                    'overblog_graphql.global_variable',
+                    'overblog_graphql.service',
                     [
                         'alias' => 'validatorFactory',
                         'public' => false,
@@ -220,7 +220,8 @@ class OverblogGraphQLExtension extends Extension
 
         $container->register(ErrorHandler::class)
             ->setArgument(0, new Reference(EventDispatcherInterface::class))
-            ->setArgument(1, new Reference(ExceptionConverterInterface::class));
+            ->setArgument(1, new Reference(ExceptionConverterInterface::class))
+            ->setArgument(2, $config['errors_handler']['internal_error_message']);
 
         $container->register(ErrorHandlerListener::class)
             ->setArgument(0, new Reference(ErrorHandler::class))

@@ -1,10 +1,10 @@
 OverblogGraphQLBundle
 ======================
 
-[![Build Status](https://travis-ci.org/overblog/GraphQLBundle.svg?branch=0.13)](https://travis-ci.org/overblog/GraphQLBundle)
-[![Build status](https://ci.appveyor.com/api/projects/status/7ksxlcgwt40q74hv/branch/0.13?svg=true)](https://ci.appveyor.com/project/overblog/graphqlbundle/branch/0.13)
-[![Scrutinizer Code Quality](https://scrutinizer-ci.com/g/overblog/GraphQLBundle/badges/quality-score.png?b=0.13)](https://scrutinizer-ci.com/g/overblog/GraphQLBundle/?branch=0.13)
-[![Coverage Status](https://coveralls.io/repos/github/overblog/GraphQLBundle/badge.svg?branch=0.13)](https://coveralls.io/github/overblog/GraphQLBundle?branch=0.13)
+![CI](https://github.com/overblog/GraphQLBundle/workflows/CI/badge.svg?branch=master)
+[![Build status](https://ci.appveyor.com/api/projects/status/7ksxlcgwt40q74hv/branch/master?svg=true)](https://ci.appveyor.com/project/overblog/graphqlbundle/branch/master)
+[![Scrutinizer Code Quality](https://scrutinizer-ci.com/g/overblog/GraphQLBundle/badges/quality-score.png?b=master)](https://scrutinizer-ci.com/g/overblog/GraphQLBundle/?branch=master)
+[![Coverage Status](https://coveralls.io/repos/github/overblog/GraphQLBundle/badge.svg?branch=master)](https://coveralls.io/github/overblog/GraphQLBundle?branch=master)
 [![Latest Stable Version](https://poser.pugx.org/overblog/graphql-bundle/version)](https://packagist.org/packages/overblog/graphql-bundle)
 [![Latest Unstable Version](https://poser.pugx.org/overblog/graphql-bundle/v/unstable)](https://packagist.org/packages/overblog/graphql-bundle)
 [![Total Downloads](https://poser.pugx.org/overblog/graphql-bundle/downloads)](https://packagist.org/packages/overblog/graphql-bundle)
@@ -13,7 +13,7 @@ This Symfony bundle provides integration of [GraphQL](https://facebook.github.io
 and [GraphQL Relay](https://facebook.github.io/relay/docs/en/graphql-server-specification.html).
 It also supports:
 * batching with [ReactRelayNetworkLayer](https://github.com/nodkz/react-relay-network-layer)
-* batching with [Apollo GraphQL](https://www.apollographql.com/docs/react/networking/network-layer/#query-batching)
+* batching with [Apollo GraphQL](https://www.apollographql.com/docs/react/api/link/apollo-link-batch-http/)
 * upload and batching upload with [apollo-upload-client](https://github.com/jaydenseric/apollo-upload-client)
 
 Browse your version documentation:
@@ -77,7 +77,7 @@ Documentation
 - [Data fetching](docs/data-fetching/index.md)
   - [Query batching](docs/data-fetching/batching.md)
   - [Promise](docs/data-fetching/promise.md)
-- [Annotations](docs/annotations/index.md)
+- [Annotations & PHP 8 Attributes](docs/annotations/index.md)
 - [Validation](docs/validation/index.md)
 - [Security](docs/security/index.md)
   - [Handle CORS](docs/security/handle-cors.md)
@@ -101,7 +101,7 @@ Talks and slides to help you start
   - [Video at SymfonyCamp UA 2017](https://www.youtube.com/watch?v=jyoYlnCPNgk) `English`
   - [Video at DPC 2017](https://www.youtube.com/watch?v=E7MjoCOGSSY) `English`
 * A GraphQL API: From hype to production *by Aurélien David* - [Twitter](https://twitter.com/spyl94), [GitHub](https://github.com/spyl94)
-  - [Slides at https://spyl.net/slides/symfonycon-cluj-2017](https://spyl.net/slides/symfonycon-cluj-2017) `English`
+  - [Slides at https://cap-collectif.slides.com/spyl/web2day-2019](https://cap-collectif.slides.com/spyl/web2day-2019) `English`
 * Une API GraphQL: du hype à la prod *by Aurélien David* - [Twitter](https://twitter.com/spyl94), [GitHub](https://github.com/spyl94)
   - [Video at PHPTour 2017 Nantes](https://www.youtube.com/watch?v=xbipW6fgD6c) `French`
 * Introduction to Symfony Flex and setting up OverblogGraphQLBundle with it *by Renato Mendes Figueiredo* - [Twitter](https://twitter.com/renatomefi), [GitHub](https://github.com/renatomefi)

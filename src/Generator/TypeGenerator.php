@@ -25,7 +25,7 @@ class TypeGenerator
     public const MODE_WRITE = 4;
     public const MODE_OVERRIDE = 8;
 
-    public const GLOBAL_VARS = 'globalVariables';
+    public const GRAPHQL_SERVICES = 'services';
 
     private static bool $classMapLoaded = false;
     private ?string $cacheDir;
@@ -113,7 +113,7 @@ class TypeGenerator
         }
 
         // Create class map file
-        if ($writeMode && $this->useClassMap) {
+        if ($writeMode && $this->useClassMap && count($classes) > 0) {
             $content = "<?php\nreturn ".var_export($classes, true).';';
 
             // replaced hard-coded absolute paths by __DIR__

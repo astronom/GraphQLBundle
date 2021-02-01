@@ -16,7 +16,6 @@ use Murtukov\PHPCodeGenerator\ArrowFunction;
 use Murtukov\PHPCodeGenerator\Closure;
 use Murtukov\PHPCodeGenerator\Config;
 use Murtukov\PHPCodeGenerator\ConverterInterface;
-use Murtukov\PHPCodeGenerator\DependencyAwareGenerator;
 use Murtukov\PHPCodeGenerator\Exception\UnrecognizedValueTypeException;
 use Murtukov\PHPCodeGenerator\GeneratorInterface;
 use Murtukov\PHPCodeGenerator\Instance;
@@ -24,16 +23,14 @@ use Murtukov\PHPCodeGenerator\Literal;
 use Murtukov\PHPCodeGenerator\PhpFile;
 use Murtukov\PHPCodeGenerator\Utils;
 use Overblog\GraphQLBundle\Definition\ConfigProcessor;
-use Overblog\GraphQLBundle\Definition\GlobalVariables;
-use Overblog\GraphQLBundle\Definition\LazyConfig;
+use Overblog\GraphQLBundle\Definition\GraphQLServices;
 use Overblog\GraphQLBundle\Definition\Type\CustomScalarType;
 use Overblog\GraphQLBundle\Definition\Type\GeneratedTypeInterface;
 use Overblog\GraphQLBundle\Error\ResolveErrors;
-use Overblog\GraphQLBundle\ExpressionLanguage\ExpressionLanguage;
+use Overblog\GraphQLBundle\ExpressionLanguage\ExpressionLanguage as EL;
 use Overblog\GraphQLBundle\Generator\Converter\ExpressionConverter;
 use Overblog\GraphQLBundle\Generator\Exception\GeneratorException;
 use Overblog\GraphQLBundle\Validator\InputValidator;
-use RuntimeException;
 use function array_filter;
 use function array_intersect;
 use function array_map;
@@ -41,7 +38,6 @@ use function array_replace_recursive;
 use function class_exists;
 use function count;
 use function explode;
-use function extract;
 use function in_array;
 use function is_array;
 use function is_callable;
@@ -58,13 +54,19 @@ use function substr;
 use function trim;
 
 /**
- * TODO (murtukov):
- *  1. Add <code> docblocks for every method
- *  2. Replace hard-coded string types with constants ('object', 'input-object' etc.).
+ * Service that exposes a single method `build` called for each GraphQL
+ * type config to build a PhpFile object.
+ *
+ * {@link https://github.com/murtukov/php-code-generator}
+ *
+ * It's responsible for building all GraphQL types (object, input-object,
+ * interface, union, enum and custom-scalar).
+ *
+ * Every method with prefix 'build' has a render example in it's PHPDoc.
  */
 class TypeBuilder
 {
-    protected const CONSTRAINTS_NAMESPACE = "Symfony\Component\Validator\Constraints";
+    protected const CONSTRAINTS_NAMESPACE = 'Symfony\Component\Validator\Constraints';
     protected const DOCBLOCK_TEXT = 'THIS FILE WAS GENERATED AND SHOULD NOT BE EDITED MANUALLY.';
     protected const BUILT_IN_TYPES = [Type::STRING, Type::INT, Type::FLOAT, Type::BOOLEAN, Type::ID];
 
@@ -82,7 +84,7 @@ class TypeBuilder
     protected string $namespace;
     protected array $config;
     protected string $type;
-    protected string $globalVars = '$'.TypeGenerator::GLOBAL_VARS;
+    protected string $gqlServices = '$'.TypeGenerator::GRAPHQL_SERVICES;
 
     public function __construct(ExpressionConverter $expressionConverter, string $namespace)
     {
@@ -93,8 +95,28 @@ class TypeBuilder
         Config::registerConverter($expressionConverter, ConverterInterface::TYPE_STRING);
     }
 
+    /**
+     * @param array{
+     *     name:          string,
+     *     class_name:    string,
+     *     fields:        array,
+     *     description?:  string,
+     *     interfaces?:   array,
+     *     resolveType?:  string,
+     *     validation?:   array,
+     *     types?:        array,
+     *     values?:       array,
+     *     serialize?:    callable,
+     *     parseValue?:   callable,
+     *     parseLiteral?: callable,
+     * } $config
+     *
+     * @throws GeneratorException
+     * @throws UnrecognizedValueTypeException
+     */
     public function build(array $config, string $type): PhpFile
     {
+        // This values should be accessible from every method
         $this->config = $config;
         $this->type = $type;
 
@@ -102,65 +124,82 @@ class TypeBuilder
 
         $class = $this->file->createClass($config['class_name'])
             ->setFinal()
-            ->setExtends(self::EXTENDS[$type])
+            ->setExtends(static::EXTENDS[$type])
             ->addImplements(GeneratedTypeInterface::class)
             ->addConst('NAME', $config['name'])
-            ->setDocBlock(self::DOCBLOCK_TEXT);
+            ->setDocBlock(static::DOCBLOCK_TEXT);
 
         $class->emptyLine();
 
         $class->createConstructor()
             ->addArgument('configProcessor', ConfigProcessor::class)
-            ->addArgument(TypeGenerator::GLOBAL_VARS, GlobalVariables::class, null)
-            ->append('$configLoader = ', $this->buildConfigLoader($config))
-            ->append('$config = $configProcessor->process(LazyConfig::create($configLoader, '.$this->globalVars.'))->load()')
-            ->append('parent::__construct($config)');
-
-        $this->file->addUse(LazyConfig::class);
+            ->addArgument(TypeGenerator::GRAPHQL_SERVICES, GraphQLServices::class)
+            ->append('$config = ', $this->buildConfig($config))
+            ->emptyLine()
+            ->append('parent::__construct($configProcessor->process($config))');
 
         return $this->file;
     }
 
     /**
-     * @return GeneratorInterface|string
+     * Converts a native GraphQL type string into the `webonyx/graphql-php`
+     * type literal. References to user-defined types are converted into
+     * TypeResovler method call and wrapped into a closure.
      *
-     * @throws RuntimeException
+     * Render examples:
+     *
+     *  -   "String"   -> Type::string()
+     *  -   "String!"  -> Type::nonNull(Type::string())
+     *  -   "[String!] -> Type::listOf(Type::nonNull(Type::string()))
+     *  -   "[Post]"   -> Type::listOf($services->getType('Post'))
+     *
+     * @return GeneratorInterface|string
      */
     protected function buildType(string $typeDefinition)
     {
         $typeNode = Parser::parseType($typeDefinition);
 
-        return $this->wrapTypeRecursive($typeNode);
+        $isReference = false;
+        $type = $this->wrapTypeRecursive($typeNode, $isReference);
+
+        if ($isReference) {
+            // References to other types should be wrapped in a closure
+            // for performance reasons
+            return ArrowFunction::new($type);
+        }
+
+        return $type;
     }
 
     /**
+     * Used by {@see buildType}.
+     *
      * @param mixed $typeNode
      *
-     * @return DependencyAwareGenerator|string
-     *
-     * @throws RuntimeException
+     * @return Literal|string
      */
-    protected function wrapTypeRecursive($typeNode)
+    protected function wrapTypeRecursive($typeNode, bool &$isReference)
     {
         switch ($typeNode->kind) {
             case NodeKind::NON_NULL_TYPE:
-                $innerType = $this->wrapTypeRecursive($typeNode->type);
+                $innerType = $this->wrapTypeRecursive($typeNode->type, $isReference);
                 $type = Literal::new("Type::nonNull($innerType)");
                 $this->file->addUse(Type::class);
                 break;
             case NodeKind::LIST_TYPE:
-                $innerType = $this->wrapTypeRecursive($typeNode->type);
+                $innerType = $this->wrapTypeRecursive($typeNode->type, $isReference);
                 $type = Literal::new("Type::listOf($innerType)");
                 $this->file->addUse(Type::class);
                 break;
-            default:
-                if (in_array($typeNode->name->value, self::BUILT_IN_TYPES)) {
+            default: // NodeKind::NAMED_TYPE
+                if (in_array($typeNode->name->value, static::BUILT_IN_TYPES)) {
                     $name = strtolower($typeNode->name->value);
                     $type = Literal::new("Type::$name()");
                     $this->file->addUse(Type::class);
                 } else {
                     $name = $typeNode->name->value;
-                    $type = "$this->globalVars->get('typeResolver')->resolve('$name')";
+                    $type = "$this->gqlServices->getType('$name')";
+                    $isReference = true;
                 }
                 break;
         }
@@ -168,90 +207,172 @@ class TypeBuilder
         return $type;
     }
 
-    protected function buildConfigLoader(array $config): ArrowFunction
+    /**
+     * Builds a config array compatible with webonyx/graphql-php type system. The content
+     * of the array depends on the GraphQL type that is currently being generated.
+     *
+     * Render example (object):
+     *
+     *      [
+     *          'name' => self::NAME,
+     *          'description' => 'Root query type',
+     *          'fields' => fn() => [
+     *              'posts' => {@see buildField},
+     *              'users' => {@see buildField},
+     *               ...
+     *           ],
+     *           'interfaces' => fn() => [
+     *               $services->getType('PostInterface'),
+     *               ...
+     *           ],
+     *           'resolveField' => {@see buildResolveField},
+     *      ]
+     *
+     * Render example (input-object):
+     *
+     *      [
+     *          'name' => self::NAME,
+     *          'description' => 'Some description.',
+     *          'validation' => {@see buildValidationRules}
+     *          'fields' => fn() => [
+     *              {@see buildField},
+     *               ...
+     *           ],
+     *      ]
+     *
+     * Render example (interface)
+     *
+     *      [
+     *          'name' => self::NAME,
+     *          'description' => 'Some description.',
+     *          'fields' => fn() => [
+     *              {@see buildField},
+     *               ...
+     *           ],
+     *          'resolveType' => {@see buildResolveType},
+     *      ]
+     *
+     * Render example (union):
+     *
+     *      [
+     *          'name' => self::NAME,
+     *          'description' => 'Some description.',
+     *          'types' => fn() => [
+     *              $services->getType('Photo'),
+     *              ...
+     *          ],
+     *          'resolveType' => {@see buildResolveType},
+     *      ]
+     *
+     * Render example (custom-scalar):
+     *
+     *      [
+     *          'name' => self::NAME,
+     *          'description' => 'Some description'
+     *          'serialize' => {@see buildScalarCallback},
+     *          'parseValue' => {@see buildScalarCallback},
+     *          'parseLiteral' => {@see buildScalarCallback},
+     *      ]
+     *
+     * Render example (enum):
+     *
+     *      [
+     *          'name' => self::NAME,
+     *          'values' => [
+     *              'PUBLISHED' => ['value' => 1],
+     *              'DRAFT' => ['value' => 2],
+     *              'STANDBY' => [
+     *                  'value' => 3,
+     *                  'description' => 'Waiting for validation',
+     *              ],
+     *              ...
+     *          ],
+     *      ]
+     *
+     * @throws GeneratorException
+     * @throws UnrecognizedValueTypeException
+     */
+    protected function buildConfig(array $config): Collection
     {
-        /**
-         * @var array         $fields
-         * @var string|null   $description
-         * @var array|null    $interfaces
-         * @var string|null   $resolveType
-         * @var array|null    $validation   - only by InputType
-         * @var array|null    $types        - only by UnionType
-         * @var array|null    $values       - only by EnumType
-         * @var callback|null $serialize    - only by CustomScalarType
-         * @var callback|null $parseValue   - only by CustomScalarType
-         * @var callback|null $parseLiteral - only by CustomScalarType
-         * @phpstan-ignore-next-line
-         */
-        extract($config);
+        // Convert to an object for a better readability
+        $c = (object) $config;
 
         $configLoader = Collection::assoc();
         $configLoader->addItem('name', new Literal('self::NAME'));
 
-        if (isset($description)) {
-            $configLoader->addItem('description', $description);
+        if (isset($c->description)) {
+            $configLoader->addItem('description', $c->description);
         }
 
-        // only by InputType (class level validation)
-        if (isset($validation)) {
-            $configLoader->addItem('validation', $this->buildValidationRules($validation));
+        // only by input-object types (for class level validation)
+        if (isset($c->validation)) {
+            $configLoader->addItem('validation', $this->buildValidationRules($c->validation));
         }
 
-        if (!empty($fields)) {
+        // only by object, input-object and interface types
+        if (!empty($c->fields)) {
             $configLoader->addItem('fields', ArrowFunction::new(
-                Collection::map($fields, [$this, 'buildField'])
+                Collection::map($c->fields, [$this, 'buildField'])
             ));
         }
 
-        if (!empty($interfaces)) {
-            $items = array_map(fn ($type) => "$this->globalVars->get('typeResolver')->resolve('$type')", $interfaces);
+        if (!empty($c->interfaces)) {
+            $items = array_map(fn ($type) => "$this->gqlServices->getType('$type')", $c->interfaces);
             $configLoader->addItem('interfaces', ArrowFunction::new(Collection::numeric($items, true)));
         }
 
-        if (!empty($types)) {
-            $items = array_map(fn ($type) => "$this->globalVars->get('typeResolver')->resolve('$type')", $types);
+        if (!empty($c->types)) {
+            $items = array_map(fn ($type) => "$this->gqlServices->getType('$type')", $c->types);
             $configLoader->addItem('types', ArrowFunction::new(Collection::numeric($items, true)));
         }
 
-        if (isset($resolveType)) {
-            $configLoader->addItem('resolveType', $this->buildResolveType($resolveType));
+        if (isset($c->resolveType)) {
+            $configLoader->addItem('resolveType', $this->buildResolveType($c->resolveType));
         }
 
-        if (isset($resolveField)) {
-            $configLoader->addItem('resolveField', $this->buildResolve($resolveField));
+        if (isset($c->resolveField)) {
+            $configLoader->addItem('resolveField', $this->buildResolve($c->resolveField));
         }
 
-        if (isset($values)) {
-            $configLoader->addItem('values', Collection::assoc($values));
+        // only by enum types
+        if (isset($c->values)) {
+            $configLoader->addItem('values', Collection::assoc($c->values));
         }
 
+        // only by custom-scalar types
         if ('custom-scalar' === $this->type) {
-            if (isset($scalarType)) {
-                $configLoader->addItem('scalarType', $scalarType);
+            if (isset($c->scalarType)) {
+                $configLoader->addItem('scalarType', $c->scalarType);
             }
 
-            if (isset($serialize)) {
-                $configLoader->addItem('serialize', $this->buildScalarCallback($serialize, 'serialize'));
+            if (isset($c->serialize)) {
+                $configLoader->addItem('serialize', $this->buildScalarCallback($c->serialize, 'serialize'));
             }
 
-            if (isset($parseValue)) {
-                $configLoader->addItem('parseValue', $this->buildScalarCallback($parseValue, 'parseValue'));
+            if (isset($c->parseValue)) {
+                $configLoader->addItem('parseValue', $this->buildScalarCallback($c->parseValue, 'parseValue'));
             }
 
-            if (isset($parseLiteral)) {
-                $configLoader->addItem('parseLiteral', $this->buildScalarCallback($parseLiteral, 'parseLiteral'));
+            if (isset($c->parseLiteral)) {
+                $configLoader->addItem('parseLiteral', $this->buildScalarCallback($c->parseLiteral, 'parseLiteral'));
             }
         }
 
-        return new ArrowFunction($configLoader);
+        return $configLoader; // @phpstan-ignore-line
     }
 
     /**
-     * @param callable $callback
+     * Builds an arrow function that calls a static method.
      *
-     * @return ArrowFunction
+     * Render example:
+     *
+     *      fn() => MyClassName::myMethodName(...\func_get_args())
+     *
+     * @param callable $callback - a callable string or a callable array
      *
      * @throws GeneratorException
+     *
+     * @return ArrowFunction
      */
     protected function buildScalarCallback($callback, string $fieldName)
     {
@@ -270,7 +391,7 @@ class TypeBuilder
         $className = Utils::resolveQualifier($class);
 
         if ($className === $this->config['class_name']) {
-            // Create alias if name of serializer is same as type name
+            // Create an alias if name of serializer is same as type name
             $className = 'Base'.$className;
             $this->file->addUse($class, $className);
         } else {
@@ -283,12 +404,46 @@ class TypeBuilder
     }
 
     /**
-     * @param mixed $resolve
+     * Builds a resolver closure that contains the compiled result of user-defined
+     * expression and optionally the validation logic.
      *
-     * @return GeneratorInterface
+     * Render example (no expression language):
+     *
+     *      function ($value, $args, $context, $info) use ($services) {
+     *          return "Hello, World!";
+     *      }
+     *
+     * Render example (with expression language):
+     *
+     *      function ($value, $args, $context, $info) use ($services) {
+     *          return $services->mutation("my_resolver", $args);
+     *      }
+     *
+     * Render example (with validation):
+     *
+     *      function ($value, $args, $context, $info) use ($services) {
+     *          $validator = {@see buildValidatorInstance}
+     *          return $services->mutation("create_post", $validator);
+     *      }
+     *
+     * Render example (with validation, but errors are injected into the user-defined resolver):
+     * {@link https://github.com/overblog/GraphQLBundle/blob/master/docs/validation/index.md#injecting-errors}
+     *
+     *      function ($value, $args, $context, $info) use ($services) {
+     *          $errors = new ResolveErrors();
+     *          $validator = {@see buildValidatorInstance}
+     *
+     *          $errors->setValidationErrors($validator->validate(null, false))
+     *
+     *          return $services->mutation("create_post", $errors);
+     *      }
+     *
+     * @param mixed $resolve
      *
      * @throws GeneratorException
      * @throws UnrecognizedValueTypeException
+     *
+     * @return GeneratorInterface|string
      */
     protected function buildResolve($resolve, ?array $validationConfig = null)
     {
@@ -296,22 +451,40 @@ class TypeBuilder
             return Collection::numeric($resolve);
         }
 
-        $closure = Closure::new()
-            ->addArguments('value', 'args', 'context', 'info')
-            ->bindVar(TypeGenerator::GLOBAL_VARS);
+        if (EL::isStringWithTrigger($resolve)) {
+            $closure = Closure::new()
+                ->addArguments('value', 'args', 'context', 'info')
+                ->bindVar(TypeGenerator::GRAPHQL_SERVICES);
 
-        // TODO (murtukov): replace usage of converter with ExpressionLanguage static method
-        if ($this->expressionConverter->check($resolve)) {
-            $injectErrors = ExpressionLanguage::expressionContainsVar('errors', $resolve);
+            $injectErrors = EL::expressionContainsVar('errors', $resolve);
 
             if ($injectErrors) {
                 $closure->append('$errors = ', Instance::new(ResolveErrors::class));
             }
 
-            $injectValidator = ExpressionLanguage::expressionContainsVar('validator', $resolve);
+            $injectValidator = EL::expressionContainsVar('validator', $resolve);
 
             if (null !== $validationConfig) {
-                $this->buildValidator($closure, $validationConfig, $injectValidator, $injectErrors);
+                $closure->append('$validator = ', $this->buildValidatorInstance($validationConfig));
+
+                // If auto-validation on or errors are injected
+                if (!$injectValidator || $injectErrors) {
+                    if (!empty($validationConfig['validationGroups'])) {
+                        $validationGroups = Collection::numeric($validationConfig['validationGroups']);
+                    } else {
+                        $validationGroups = 'null';
+                    }
+
+                    $closure->emptyLine();
+
+                    if ($injectErrors) {
+                        $closure->append('$errors->setValidationErrors($validator->validate(', $validationGroups, ', false))');
+                    } else {
+                        $closure->append('$validator->validate(', $validationGroups, ')');
+                    }
+
+                    $closure->emptyLine();
+                }
             } elseif (true === $injectValidator) {
                 throw new GeneratorException(
                     'Unable to inject an instance of the InputValidator. No validation constraints provided. '.
@@ -325,18 +498,29 @@ class TypeBuilder
             return $closure;
         }
 
-        $closure->append('return ', Utils::stringify($resolve));
-
-        return $closure;
+        return ArrowFunction::new($resolve);
     }
 
-    protected function buildValidator(Closure $closure, array $mapping, bool $injectValidator, bool $injectErrors): void
+    /**
+     * Render example:
+     *
+     *      new InputValidator(
+     *          \func_get_args(),
+     *          $services->get('container')->get('validator'),
+     *          $services->get('validatorFactory'),
+     *          {@see buildProperties},
+     *          {@see buildValidationRules},
+     *      )
+     *
+     * @throws GeneratorException
+     */
+    protected function buildValidatorInstance(array $mapping): Instance
     {
         $validator = Instance::new(InputValidator::class)
             ->setMultiline()
             ->addArgument(new Literal('\\func_get_args()'))
-            ->addArgument("$this->globalVars->get('container')->get('validator')")
-            ->addArgument("$this->globalVars->get('validatorFactory')");
+            ->addArgument("$this->gqlServices->get('container')->get('validator')")
+            ->addArgument("$this->gqlServices->get('validatorFactory')");
 
         if (!empty($mapping['properties'])) {
             $validator->addArgument($this->buildProperties($mapping['properties']));
@@ -346,73 +530,74 @@ class TypeBuilder
             $validator->addArgument($this->buildValidationRules($mapping['class']));
         }
 
-        $closure->append('$validator = ', $validator);
-
-        // If auto-validation on or errors are injected
-        if (!$injectValidator || $injectErrors) {
-            if (!empty($mapping['validationGroups'])) {
-                $validationGroups = Collection::numeric($mapping['validationGroups']);
-            } else {
-                $validationGroups = 'null';
-            }
-
-            $closure->emptyLine();
-
-            if ($injectErrors) {
-                $closure->append('$errors->setValidationErrors($validator->validate(', $validationGroups, ', false))');
-            } else {
-                $closure->append('$validator->validate(', $validationGroups, ')');
-            }
-
-            $closure->emptyLine();
-        }
+        return $validator;
     }
 
-    protected function buildValidationRules(array $mapping): Collection
+    /**
+     * Render example:
+     *
+     *      [
+     *          'link' => {@see normalizeLink}
+     *          'cascade' => {@see buildCascade},
+     *          'constraints' => {@see buildConstraints}
+     *      ]
+     *
+     * If only constraints provided, uses {@see buildConstraints} directly.
+     *
+     * @param array{
+     *     constraints: array,
+     *     link: string,
+     *     cascade: array
+     * } $config
+     *
+     * @throws GeneratorException
+     */
+    protected function buildValidationRules(array $config): Collection
     {
-        /**
-         * @var array  $constraints
-         * @var string $link
-         * @var array  $cascade
-         * @phpstan-ignore-next-line
-         */
-        extract($mapping);
+        // Convert to object for better readability
+        $c = (object) $config;
 
         $array = Collection::assoc();
 
-        if (!empty($link)) {
-            if (false === strpos($link, '::')) {
-                // e.g.: App\Entity\Droid
-                $array->addItem('link', $link);
+        if (!empty($c->link)) {
+            if (false === strpos($c->link, '::')) {
+                // e.g. App\Entity\Droid
+                $array->addItem('link', $c->link);
             } else {
                 // e.g. App\Entity\Droid::$id
-                $array->addItem('link', Collection::numeric($this->normalizeLink($link)));
+                $array->addItem('link', Collection::numeric($this->normalizeLink($c->link)));
             }
         }
 
-        if (!empty($cascade)) {
-            $array->addItem('cascade', $this->buildCascade($cascade));
+        if (!empty($c->cascade)) {
+            $array->addItem('cascade', $this->buildCascade($c->cascade));
         }
 
-        if (!empty($constraints)) {
+        if (!empty($c->constraints)) {
             // If there are only constarainst, dont use additional nesting
             if (0 === $array->count()) {
-                return $this->buildConstraints($constraints);
+                return $this->buildConstraints($c->constraints);
             }
-            $array->addItem('constraints', $this->buildConstraints($constraints));
+            $array->addItem('constraints', $this->buildConstraints($c->constraints));
         }
 
         return $array; // @phpstan-ignore-line
     }
 
     /**
-     * <code>
-     * [
-     *     new NotNull(),
-     *     new Length(['min' => 5, 'max' => 10]),
-     *     ...
-     * ]
-     * </code>.
+     * Builds a numeric multiline array with Symfony Constraint instances.
+     * The array is used by {@see InputValidator} during requests.
+     *
+     * Render example:
+     *
+     *      [
+     *          new NotNull(),
+     *          new Length([
+     *              'min' => 5,
+     *              'max' => 10
+     *          ]),
+     *          ...
+     *      ]
      *
      * @throws GeneratorException
      */
@@ -431,8 +616,8 @@ class TypeBuilder
                 $this->file->addUse($fqcn);
             } else {
                 // Symfony constraint
-                $this->file->addUseGroup(self::CONSTRAINTS_NAMESPACE, $name);
-                $fqcn = self::CONSTRAINTS_NAMESPACE."\\$name";
+                $this->file->addUseGroup(static::CONSTRAINTS_NAMESPACE, $name);
+                $fqcn = static::CONSTRAINTS_NAMESPACE."\\$name";
             }
 
             if (!class_exists($fqcn)) {
@@ -460,38 +645,66 @@ class TypeBuilder
     }
 
     /**
+     * Builds an assoc multiline array with a predefined shape. The array
+     * is used by {@see InputValidator} during requests.
+     *
+     * Possible keys are: 'groups', 'isCollection' and 'referenceType'.
+     *
+     * Render example:
+     *
+     *      [
+     *          'groups' => ['my_group'],
+     *          'isCollection' => true,
+     *          'referenceType' => $services->getType('Article')
+     *      ]
+     *
+     * @param array{
+     *     referenceType: string,
+     *     groups:        array,
+     *     isCollection:  bool
+     * } $cascade
+     *
      * @throws GeneratorException
      */
     protected function buildCascade(array $cascade): Collection
     {
+        $c = (object) $cascade;
+
         /**
-         * @var string $referenceType
-         * @var array  $groups
-         * @var bool   $isCollection
-         * @phpstan-ignore-next-line
+         * todo: remove this type-hint after fixing return type in the php generator
+         *
+         * @var Collection $array
          */
-        extract($cascade);
+        $array = Collection::assoc()->addIfNotEmpty('groups', $c->groups);
 
-        $result = Collection::assoc()
-            ->addIfNotEmpty('groups', $groups);
-
-        if (isset($isCollection)) {
-            $result->addItem('isCollection', $isCollection);
+        if (isset($c->isCollection)) {
+            $array->addItem('isCollection', $c->isCollection);
         }
 
-        if (isset($referenceType)) {
-            $type = trim($referenceType, '[]!');
+        if (isset($c->referenceType)) {
+            $type = trim($c->referenceType, '[]!');
 
-            if (in_array($type, self::BUILT_IN_TYPES)) {
+            if (in_array($type, static::BUILT_IN_TYPES)) {
                 throw new GeneratorException('Cascade validation cannot be applied to built-in types.');
             }
 
-            $result->addItem('referenceType', "$this->globalVars->get('typeResolver')->resolve('$referenceType')");
+            $array->addItem('referenceType', "$this->gqlServices->getType('$c->referenceType')");
         }
 
-        return $result; // @phpstan-ignore-line
+        return $array; // @phpstan-ignore-line
     }
 
+    /**
+     * Render example:
+     *
+     *      [
+     *          'firstName' => {@see buildValidationRules},
+     *          'lastName' => {@see buildValidationRules},
+     *          ...
+     *      ]
+     *
+     * @throws GeneratorException
+     */
     protected function buildProperties(array $properties): Collection
     {
         $array = Collection::assoc();
@@ -504,122 +717,172 @@ class TypeBuilder
     }
 
     /**
-     * @return GeneratorInterface|Collection|string
+     * Render example:
+     *
+     *      [
+     *          'type' => {@see buildType},
+     *          'description' => 'Some description.',
+     *          'deprecationReason' => 'This field will be removed soon.',
+     *          'args' => fn() => [
+     *              {@see buildArg},
+     *              {@see buildArg},
+     *               ...
+     *           ],
+     *          'resolve' => {@see buildResolve},
+     *          'complexity' => {@see buildComplexity},
+     *      ]
+     *
+     * @param array{
+     *     type:              string,
+     *     resolve?:          string,
+     *     description?:      string,
+     *     args?:             array,
+     *     complexity?:       string,
+     *     deprecatedReason?: string,
+     *     validation?:       array,
+     * } $fieldConfig
+     *
+     * @internal
      *
      * @throws GeneratorException
      * @throws UnrecognizedValueTypeException
+     *
+     * @return GeneratorInterface|Collection|string
      */
     public function buildField(array $fieldConfig /*, $fieldname */)
     {
-        /**
-         * @var string      $type
-         * @var string|null $resolve
-         * @var string|null $description
-         * @var array|null  $args
-         * @var string|null $complexity
-         * @var string|null $deprecationReason
-         * @phpstan-ignore-next-line
-         */
-        extract($fieldConfig);
+        // Convert to object for better readability
+        $c = (object) $fieldConfig;
 
         // If there is only 'type', use shorthand
-        if (1 === count($fieldConfig) && isset($type)) {
-            return $this->buildType($type);
+        if (1 === count($fieldConfig) && isset($c->type)) {
+            return $this->buildType($c->type);
         }
 
         $field = Collection::assoc()
-            ->addItem('type', $this->buildType($type));
+            ->addItem('type', $this->buildType($c->type));
 
         // only for object types
-        if (isset($resolve)) {
+        if (isset($c->resolve)) {
             $validationConfig = $this->restructureObjectValidationConfig($fieldConfig);
-            $field->addItem('resolve', $this->buildResolve($resolve, $validationConfig));
+            $field->addItem('resolve', $this->buildResolve($c->resolve, $validationConfig));
         }
 
-        if (isset($deprecationReason)) {
-            $field->addItem('deprecationReason', $deprecationReason);
+        if (isset($c->deprecationReason)) {
+            $field->addItem('deprecationReason', $c->deprecationReason);
         }
 
-        if (isset($description)) {
-            $field->addItem('description', $description);
+        if (isset($c->description)) {
+            $field->addItem('description', $c->description);
         }
 
-        if (!empty($args)) {
-            $field->addItem('args', Collection::map($args, [$this, 'buildArg'], false));
+        if (!empty($c->args)) {
+            $field->addItem('args', Collection::map($c->args, [$this, 'buildArg'], false));
         }
 
-        if (isset($complexity)) {
-            $field->addItem('complexity', $this->buildComplexity($complexity));
+        if (isset($c->complexity)) {
+            $field->addItem('complexity', $this->buildComplexity($c->complexity));
         }
 
-        if (isset($public)) {
-            $field->addItem('public', $this->buildPublic($public));
+        if (isset($c->public)) {
+            $field->addItem('public', $this->buildPublic($c->public));
         }
 
-        if (isset($access)) {
-            $field->addItem('access', $this->buildAccess($access));
+        if (isset($c->access)) {
+            $field->addItem('access', $this->buildAccess($c->access));
         }
 
-        if (!empty($access) && is_string($access) && ExpressionLanguage::expressionContainsVar('object', $access)) {
+        if (!empty($c->access) && is_string($c->access) && EL::expressionContainsVar('object', $c->access)) {
             $field->addItem('useStrictAccess', false);
         }
 
-        if ('input-object' === $this->type && isset($validation)) {
-            $this->restructureInputValidationConfig($fieldConfig);
-            $field->addItem('validation', $this->buildValidationRules($fieldConfig['validation']));
+        if ('input-object' === $this->type && isset($c->validation)) {
+            // restructure validation config
+            if (!empty($c->validation['cascade'])) {
+                $c->validation['cascade']['isCollection'] = $this->isCollectionType($c->type);
+                $c->validation['cascade']['referenceType'] = trim($c->type, '[]!');
+            }
+
+            $field->addItem('validation', $this->buildValidationRules($c->validation));
         }
 
         return $field;
     }
 
+    /**
+     * Render example:
+     *
+     *      [
+     *          'name' => 'username',
+     *          'type' => {@see buildType},
+     *          'description' => 'Some fancy description.',
+     *          'defaultValue' => 'admin',
+     *      ]
+     *
+     * @internal
+     *
+     * @param array{
+     *     type: string,
+     *     description?: string,
+     *     defaultValue?: string
+     * } $argConfig
+     */
     public function buildArg(array $argConfig, string $argName): Collection
     {
-        /**
-         * @var string      $type
-         * @var string|null $description
-         * @var string|null $defaultValue
-         * @phpstan-ignore-next-line
-         */
-        extract($argConfig);
+        // Convert to object for better readability
+        $c = (object) $argConfig;
 
         $arg = Collection::assoc()
             ->addItem('name', $argName)
-            ->addItem('type', $this->buildType($type));
+            ->addItem('type', $this->buildType($c->type));
 
-        if (isset($description)) {
-            $arg->addIfNotEmpty('description', $description);
+        if (isset($c->description)) {
+            $arg->addIfNotEmpty('description', $c->description);
         }
 
-        if (isset($defaultValue)) {
-            $arg->addIfNotEmpty('defaultValue', $defaultValue);
+        if (isset($c->defaultValue)) {
+            $arg->addIfNotEmpty('defaultValue', $c->defaultValue);
         }
 
         return $arg; // @phpstan-ignore-line
     }
 
     /**
-     * @param string $complexity
+     * Builds a closure or an arrow function, depending on whether the `args` param is provided.
+     *
+     * Render example (closure):
+     *
+     *      function ($value, $arguments) use ($services) {
+     *          $args = $services->get('argumentFactory')->create($arguments);
+     *          return ($args['age'] + 5);
+     *      }
+     *
+     * Render example (arrow function):
+     *
+     *      fn($childrenComplexity) => ($childrenComplexity + 20);
+     *
+     * @param mixed $complexity
      *
      * @return Closure|mixed
      */
     protected function buildComplexity($complexity)
     {
-        if ($this->expressionConverter->check($complexity)) {
+        if (EL::isStringWithTrigger($complexity)) {
             $expression = $this->expressionConverter->convert($complexity);
 
-            if (ExpressionLanguage::expressionContainsVar('args', $complexity)) {
+            if (EL::expressionContainsVar('args', $complexity)) {
                 return Closure::new()
                     ->addArgument('childrenComplexity')
                     ->addArgument('arguments', '', [])
-                    ->bindVar(TypeGenerator::GLOBAL_VARS)
-                    ->append('$args = ', "$this->globalVars->get('argumentFactory')->create(\$arguments)")
+                    ->bindVar(TypeGenerator::GRAPHQL_SERVICES)
+                    ->append('$args = ', "$this->gqlServices->get('argumentFactory')->create(\$arguments)")
                     ->append('return ', $expression)
                 ;
             }
 
             $arrow = ArrowFunction::new(is_string($expression) ? new Literal($expression) : $expression);
 
-            if (ExpressionLanguage::expressionContainsVar('childrenComplexity', $complexity)) {
+            if (EL::expressionContainsVar('childrenComplexity', $complexity)) {
                 $arrow->addArgument('childrenComplexity');
             }
 
@@ -630,21 +893,28 @@ class TypeBuilder
     }
 
     /**
+     * Builds an arrow function from a string with an expression prefix,
+     * otherwise just returns the provided value back untouched.
+     *
+     * Render example (if expression):
+     *
+     *      fn($fieldName, $typeName = self::NAME) => ($fieldName == "name")
+     *
      * @param mixed $public
      *
      * @return ArrowFunction|mixed
      */
     protected function buildPublic($public)
     {
-        if ($this->expressionConverter->check($public)) {
+        if (EL::isStringWithTrigger($public)) {
             $expression = $this->expressionConverter->convert($public);
             $arrow = ArrowFunction::new(Literal::new($expression));
 
-            if (ExpressionLanguage::expressionContainsVar('fieldName', $public)) {
+            if (EL::expressionContainsVar('fieldName', $public)) {
                 $arrow->addArgument('fieldName');
             }
 
-            if (ExpressionLanguage::expressionContainsVar('typeName', $public)) {
+            if (EL::expressionContainsVar('typeName', $public)) {
                 $arrow->addArgument('fieldName');
                 $arrow->addArgument('typeName', '', new Literal('self::NAME'));
             }
@@ -656,13 +926,20 @@ class TypeBuilder
     }
 
     /**
+     * Builds an arrow function from a string with an expression prefix,
+     * otherwise just returns the provided value back untouched.
+     *
+     * Render example (if expression):
+     *
+     *      fn($value, $args, $context, $info, $object) => $services->get('private_service')->hasAccess()
+     *
      * @param mixed $access
      *
      * @return ArrowFunction|mixed
      */
     protected function buildAccess($access)
     {
-        if ($this->expressionConverter->check($access)) {
+        if (EL::isStringWithTrigger($access)) {
             $expression = $this->expressionConverter->convert($access);
 
             return ArrowFunction::new()
@@ -674,13 +951,20 @@ class TypeBuilder
     }
 
     /**
+     * Builds an arrow function from a string with an expression prefix,
+     * otherwise just returns the provided value back untouched.
+     *
+     * Render example:
+     *
+     *      fn($value, $context, $info) => $services->getType($value)
+     *
      * @param mixed $resolveType
      *
      * @return mixed|ArrowFunction
      */
     protected function buildResolveType($resolveType)
     {
-        if ($this->expressionConverter->check($resolveType)) {
+        if (EL::isStringWithTrigger($resolveType)) {
             $expression = $this->expressionConverter->convert($resolveType);
 
             return ArrowFunction::new()
@@ -689,17 +973,6 @@ class TypeBuilder
         }
 
         return $resolveType;
-    }
-
-    // TODO (murtukov): rework this method to use builders
-    protected function restructureInputValidationConfig(array &$fieldConfig): void
-    {
-        if (empty($fieldConfig['validation']['cascade'])) {
-            return;
-        }
-
-        $fieldConfig['validation']['cascade']['isCollection'] = $this->isCollectionType($fieldConfig['type']);
-        $fieldConfig['validation']['cascade']['referenceType'] = trim($fieldConfig['type'], '[]!');
     }
 
     // TODO (murtukov): rework this method to use builders
@@ -758,13 +1031,13 @@ class TypeBuilder
     }
 
     /**
-     * Creates and array from a formatted string, e.g.:.
+     * Creates and array from a formatted string.
      *
-     * ```
-     *    "App\Entity\User::$firstName"  -> ['App\Entity\User', 'firstName', 'property']
-     *    "App\Entity\User::firstName()" -> ['App\Entity\User', 'firstName', 'getter']
-     *    "App\Entity\User::firstName"   -> ['App\Entity\User', 'firstName', 'member']
-     * ```.
+     * Examples:
+     *
+     *      "App\Entity\User::$firstName"  -> ['App\Entity\User', 'firstName', 'property']
+     *      "App\Entity\User::firstName()" -> ['App\Entity\User', 'firstName', 'getter']
+     *      "App\Entity\User::firstName"   -> ['App\Entity\User', 'firstName', 'member']
      */
     protected function normalizeLink(string $link): array
     {
